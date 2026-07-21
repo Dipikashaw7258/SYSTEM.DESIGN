@@ -1,0 +1,93 @@
+# CampusConnect Notifications Service Design Document
+
+**Engine / Environment:** Markdown Architecture Document  
+**Author GitHub:** dipikashaw
+
+---
+
+## 1. High-Level Design
+
+### Core Modules / Components
+* **Notification Generation Module:** Intercepts domain triggers (e.g., assignment publication or enrollment changes) and constructs raw notification payloads.
+* **User Preferences Module:** Stores and queries recipient preferences (e.g., preferred channels such as email or SMS, and quiet hour settings).
+* **Delivery & Dispatcher Module:** Formats payloads according to provider requirements and dispatches alerts through external gateways (e.g., SendGrid, Firebase).
+* **Notification Database:** Persists notification logs, audit history, and delivery statuses.
+
+### Layered Architecture & Request Flow
+* **Presentation Layer:** Exposes internal REST/gRPC endpoints and handles incoming webhooks and client requests.
+* **Business Layer:** Contains core application logic, applying routing rules, evaluating user preferences, and invoking template rendering.
+* **Data-Access Layer (DAL):** Abstracts data interaction via repository interfaces to manage persistence without exposing database logic.
+* **Database Layer:** Manages persistent records for notification histories, status logs, and preference records.
+
+> **Event Flow:** When an instructor posts a new assignment, the Course Service sends a payload to the **Presentation Layer**. The **Business Layer** catches the event, queries student preferences via the **Data-Access Layer** from the **Database Layer**, filters out opted-out delivery channels, and passes the formatted alert to the **Delivery Module** to dispatch it asynchronously to external provider gateways.
+
+---
+
+## 2. Architectural Style Choice
+
+* **Selected Style:** **Event-Driven Architecture (EDA)**
+
+### Concrete Advantages
+1. **Loose Coupling:** The core course/enrollment system publishes events (`AssignmentPosted`, `EnrollmentUpdated`) to an event broker without needing direct knowledge of notification delivery logic.
+2. **High Availability:** Downtime or rate limits in third-party messaging services do not block or delay primary enrollment/course operations.
+3. **Asynchronous Throughput:** Notification events are queued and processed asynchronously, preventing latency spikes for active web users.
+
+### Concrete Challenges
+1. **Ordering & Eventual Consistency:** Ensuring that sequential notifications arrive in proper order (e.g., "Status Changed to Waitlisted" before "Status Changed to Enrolled") requires partition key management.
+2. **Distributed Tracing Complexity:** Tracking down failures across asynchronous message queues and event consumers is significantly harder than debugging a synchronous call stack.
+
+---
+
+## 3. Low-Level Design
+
+### Class 1: `Notification`
+* **Attributes:**
+  * `notification_id: str`
+  * `recipient_id: str`
+  * `message_body: str`
+  * `status: str`
+  * `created_at: datetime`
+* **Methods:**
+  * `mark_as_sent() -> None`
+  * `mark_as_failed(reason: str) -> None`
+  * `format_payload() -> dict`
+* **SOLID Principle:** **Single Responsibility Principle (SRP)** — This class is exclusively responsible for encapsulating the state and state transitions of an individual notification object.
+
+### Class 2: `NotificationDispatcher`
+* **Attributes:**
+  * `delivery_channel: INotificationChannel`
+  * `max_retry_attempts: int`
+* **Methods:**
+  * `dispatch(notification: Notification) -> bool`
+  * `set_channel(channel: INotificationChannel) -> None`
+* **SOLID Principle:** **Dependency Inversion Principle (DIP)** — The dispatcher depends on the high-level `INotificationChannel` abstraction rather than concrete delivery channel implementations.
+
+### Interface: `INotificationChannel`
+* **Method Signatures:**
+  * `send(recipient: str, payload: dict) -> bool`
+  * `validate_destination(destination: str) -> bool`
+* **Flexibility Provided:** The `INotificationChannel` interface decouples dispatching logic from specific messaging APIs. This allows new delivery providers (e.g., WhatsApp, Slack, Push notifications) to be plugged in by implementing the interface without modifying the `NotificationDispatcher` class.
+
+---
+
+## 4. Scalability Plan
+
+* **Expected Bottleneck:** Notification delivery volume bursts during peak enrollment windows and mass deadline postings.
+* **Scaling Choice:** **Horizontal Scaling** — Adding multiple stateless notification processing worker instances behind a load balancer to handle concurrent outbound traffic spikes.
+* **Elasticity Policy:** Scale out by adding 2 worker instances when queue length exceeds 5,000 messages or CPU usage exceeds 75% for 2 consecutive minutes. Scale in by terminating idle instances when queue length drops below 100 messages and CPU usage remains under 20% for 10 consecutive minutes.
+* **Load-Balancing Algorithm:** **Least Connection** — Ensures incoming notification processing tasks are assigned to servers with the fewest active network connections, preventing worker overload during long-running socket calls to external API gateways.
+
+---
+
+## 5. Cloud Deployment Recommendation
+
+* **Deployment Model:** **Public Cloud** (e.g., AWS or GCP)
+* **Service Model:** **Platform as a Service (PaaS)** (e.g., AWS Elastic Beanstalk or Google App Engine)
+
+### NIST Characteristics Justification
+1. **Rapid Elasticity:** Automatically provisions additional compute capacity during unexpected enrollment rushes without manual infrastructure setup.
+2. **Resource Pooling:** Dynamically shares multi-tenant compute resources, minimizing idle operational costs during off-peak periods like academic breaks.
+
+### Cloud Challenge & Mitigation
+* **Named Challenge:** **Vendor Lock-in**
+* **Mitigation:** Packaging the application into **Docker containers** deployed on PaaS ensures that the service can be migrated to another cloud provider or on-premise container platform with minimal configuration adjustments.
